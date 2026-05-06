@@ -1,6 +1,18 @@
 (() => {
   "use strict";
 
+  const CONTENT_VERSION = "0.5.0";
+  const CONTENT_BOOT_FLAG = "__CGPT_LONG_CHAT_LOADER_CONTENT_ACTIVE__";
+  if (window[CONTENT_BOOT_FLAG]) {
+    try {
+      window.dispatchEvent(new CustomEvent("cgpt-lb-force-scan", { detail: CONTENT_VERSION }));
+    } catch {
+      // Ignore duplicate-injection notification failures.
+    }
+    return;
+  }
+  window[CONTENT_BOOT_FLAG] = CONTENT_VERSION;
+
   const SETTINGS_KEY = "cgptLongChatLoader.settings";
   const SETTINGS_ATTR = "data-cgpt-lb-settings";
   const TRIMMED_ATTR = "data-cgpt-lb-api-trimmed";
@@ -10,12 +22,29 @@
   const SETTINGS_EVENT = "cgpt-lb-settings";
   const STATS_EVENT = "cgpt-lb-trim-stats";
   const LOCATION_EVENT = "cgpt-lb-locationchange";
+  const MAINTENANCE_EVENT = "cgpt-lb-maintenance";
   const HIDDEN_CLASS = "cgpt-lb-hidden";
   const CONTAINED_CLASS = "cgpt-lb-contained";
   const LOAD_MORE_ID = "cgpt-lb-load-more";
   const STATUS_ID = "cgpt-lb-status";
-  const TURN_SELECTOR = '[data-testid^="conversation-turn-"]';
-  const ROLE_SELECTOR = "[data-message-author-role]";
+  const TURN_SELECTOR = [
+    '[data-testid^="conversation-turn-"]',
+    '[data-testid*="conversation-turn"]',
+    '[data-turn-id]',
+    '[data-message-id]'
+  ].join(", ");
+  const ROLE_SELECTOR = [
+    "[data-message-author-role]",
+    "[data-message-author]",
+    "[data-author-role]"
+  ].join(", ");
+  const TURN_CLOSEST_SELECTOR = [
+    '[data-testid^="conversation-turn-"]',
+    '[data-testid*="conversation-turn"]',
+    '[data-turn-id]',
+    "article",
+    '[role="article"]'
+  ].join(", ");
 
   const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
@@ -23,7 +52,10 @@
     visibleTurns: 4,
     loadMoreBatch: 4,
     prefetchBatches: 2,
-    apiCacheEntries: 0,
+    apiCacheEntries: 1,
+    apiCacheMaxKb: 1024,
+    maintenanceEnabled: true,
+    maintenanceIntervalSec: 30,
     cssContainmentEnabled: true,
     showStatus: false,
     debug: false
@@ -43,6 +75,12 @@
   let observer = null;
   let observerTarget = null;
   let navigationTimer = 0;
+  let maintenanceTimer = 0;
+  let maintenanceScheduled = false;
+  let lastMaintenanceAt = 0;
+  let pendingRelevantMutations = 0;
+  let lastObservedTurnTotal = 0;
+  let lastLoadMoreState = { visible: false, mode: "none", hiddenCount: 0, reason: "init" };
 
   boot();
 
@@ -53,6 +91,8 @@
     listenForPopupMetrics();
     listenForTrimStats();
     startNavigationWatcher();
+    startMaintenanceLoop();
+    window.addEventListener("cgpt-lb-force-scan", () => scheduleScan(true));
 
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", () => {
@@ -64,8 +104,12 @@
     ensureObserverTarget();
     scheduleScan(true);
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) scheduleScan();
+      if (!document.hidden) {
+        scheduleScan();
+        scheduleMaintenance("visibility");
+      }
     }, { passive: true });
+    window.addEventListener("focus", () => scheduleMaintenance("focus"), { passive: true });
   }
 
   function loadSettings() {
@@ -95,7 +139,10 @@
       visibleTurns: clampInt(merged.visibleTurns, 1, 100, DEFAULT_SETTINGS.visibleTurns),
       loadMoreBatch: clampInt(merged.loadMoreBatch, 1, 100, DEFAULT_SETTINGS.loadMoreBatch),
       prefetchBatches: clampInt(merged.prefetchBatches, 0, 30, DEFAULT_SETTINGS.prefetchBatches),
-      apiCacheEntries: clampInt(cacheValue, 0, 3, DEFAULT_SETTINGS.apiCacheEntries),
+      apiCacheEntries: clampInt(cacheValue, 1, 2, DEFAULT_SETTINGS.apiCacheEntries),
+      apiCacheMaxKb: clampInt(merged.apiCacheMaxKb, 128, 4096, DEFAULT_SETTINGS.apiCacheMaxKb),
+      maintenanceEnabled: Boolean(merged.maintenanceEnabled),
+      maintenanceIntervalSec: clampInt(merged.maintenanceIntervalSec, 10, 300, DEFAULT_SETTINGS.maintenanceIntervalSec),
       cssContainmentEnabled: Boolean(merged.cssContainmentEnabled ?? merged.contentVisibilityEnabled),
       showStatus: Boolean(merged.showStatus),
       debug: Boolean(merged.debug)
@@ -145,6 +192,7 @@
       settings = normalizeSettings(next);
       writeSettingsBridge();
       ensureObserverTarget();
+      restartMaintenanceLoop();
       scanAndApply();
     });
   }
@@ -181,6 +229,79 @@
     navigationTimer = window.setInterval(checkNavigation, 3000);
   }
 
+  function startMaintenanceLoop() {
+    stopMaintenanceLoop();
+    if (!settings.enabled || !settings.maintenanceEnabled) return;
+    const intervalMs = settings.maintenanceIntervalSec * 1000;
+    maintenanceTimer = window.setInterval(() => scheduleMaintenance("interval"), intervalMs);
+  }
+
+  function restartMaintenanceLoop() {
+    startMaintenanceLoop();
+    scheduleMaintenance("settings");
+  }
+
+  function stopMaintenanceLoop() {
+    if (maintenanceTimer) clearInterval(maintenanceTimer);
+    maintenanceTimer = 0;
+    maintenanceScheduled = false;
+  }
+
+  function scheduleMaintenance(reason) {
+    if (!settings.enabled || !settings.maintenanceEnabled || !isLikelyChatSurface() || document.hidden) return;
+    if (maintenanceScheduled) return;
+    maintenanceScheduled = true;
+
+    const run = () => {
+      maintenanceScheduled = false;
+      runMaintenance(reason);
+    };
+
+    if (typeof requestIdleCallback === "function") {
+      requestIdleCallback(run, { timeout: 1500 });
+    } else {
+      window.setTimeout(run, 750);
+    }
+  }
+
+  function runMaintenance(reason) {
+    if (!settings.enabled || !settings.maintenanceEnabled || !isLikelyChatSurface()) return;
+    lastMaintenanceAt = Date.now();
+    dispatchMaintenanceToMain(reason);
+    compactVolatileState();
+    ensureObserverTarget();
+    scanAndApply();
+  }
+
+  function dispatchMaintenanceToMain(reason) {
+    try {
+      window.dispatchEvent(new CustomEvent(MAINTENANCE_EVENT, {
+        detail: JSON.stringify({ reason: String(reason || "interval"), timestamp: Date.now() })
+      }));
+    } catch {
+      // Non-critical bridge failure.
+    }
+  }
+
+  function compactVolatileState() {
+    if (lastApiStats && (!statsApplyToThisPage(lastApiStats) || isStaleTimestamp(lastApiStats.timestamp, 180_000))) {
+      lastApiStats = null;
+      apiTrimmedCurrentConversation = false;
+    }
+
+    const currentTotal = lastDomMetrics.total || queryMessageTurns().length || 0;
+    if (currentTotal < lastObservedTurnTotal) {
+      extraVisibleMessages = Math.min(extraVisibleMessages, Math.max(0, currentTotal - settings.visibleTurns * 2));
+    }
+    lastObservedTurnTotal = currentTotal;
+    pendingRelevantMutations = 0;
+  }
+
+  function isStaleTimestamp(timestamp, ttlMs) {
+    const value = Number(timestamp);
+    return !value || Date.now() - value > ttlMs;
+  }
+
   function checkNavigation() {
     if (location.href === lastUrl) return;
     lastUrl = location.href;
@@ -191,6 +312,7 @@
     hideLoadMore();
     ensureObserverTarget();
     scheduleScan(true);
+    scheduleMaintenance("navigation");
   }
 
   function isLikelyChatSurface() {
@@ -214,6 +336,7 @@
     observer = new MutationObserver((mutations) => {
       for (const mutation of mutations) {
         if (isRelevantMutation(mutation)) {
+          pendingRelevantMutations += 1;
           scheduleScan();
           return;
         }
@@ -341,17 +464,81 @@
 
   function queryMessageTurns() {
     const scope = getMessageScope();
-    const primary = safeQueryAll(TURN_SELECTOR, scope);
-    if (primary.length) return sortDocumentOrder(uniqueElements(primary)).filter((el) => isAttached(el) && !isExtensionUi(el));
-
     const candidates = [];
-    const roleNodes = safeQueryAll(ROLE_SELECTOR, scope);
-    for (const node of roleNodes) {
-      const turn = node.closest(`${TURN_SELECTOR}, article, section, [role="article"]`);
-      if (turn instanceof HTMLElement) candidates.push(turn);
+
+    for (const el of safeQueryAll(TURN_SELECTOR, scope)) {
+      const turn = normalizeTurnElement(el, scope);
+      if (turn) candidates.push(turn);
     }
 
-    return removeNested(sortDocumentOrder(uniqueElements(candidates))).filter((el) => isAttached(el) && !isExtensionUi(el));
+    for (const node of safeQueryAll(ROLE_SELECTOR, scope)) {
+      const turn = normalizeTurnElement(node, scope);
+      if (turn) candidates.push(turn);
+    }
+
+    // Last-resort fallback for ChatGPT DOM variants that keep role metadata off the wrapper
+    // but still render assistant messages through markdown/prose blocks. This runs only
+    // inside the main chat surface and is normalized upward to avoid hiding inner blocks.
+    if (candidates.length === 0) {
+      for (const node of safeQueryAll(".markdown, .prose", scope)) {
+        const turn = normalizeTurnElement(node, scope);
+        if (turn) candidates.push(turn);
+      }
+    }
+
+    return removeNested(sortDocumentOrder(uniqueElements(candidates)))
+      .filter((el) => isAttached(el) && !isExtensionUi(el) && isLikelyMessageTurn(el, scope));
+  }
+
+  function normalizeTurnElement(el, scope) {
+    if (!(el instanceof HTMLElement)) return null;
+    if (isExtensionUi(el)) return null;
+
+    const direct = el.closest(TURN_CLOSEST_SELECTOR);
+    if (direct instanceof HTMLElement && containsWithinScope(scope, direct)) return direct;
+
+    return climbToStableMessageContainer(el, scope);
+  }
+
+  function climbToStableMessageContainer(el, scope) {
+    let node = el instanceof HTMLElement ? el : null;
+    let fallback = null;
+    let depth = 0;
+
+    while (node && node !== scope && node !== document.body && depth < 8) {
+      if (!(node instanceof HTMLElement)) break;
+      const hasRole = Boolean(node.querySelector && node.querySelector(ROLE_SELECTOR));
+      const hasMessageId = Boolean(node.querySelector && node.querySelector("[data-message-id]"));
+      const textLength = (node.textContent || "").trim().length;
+      if ((hasRole || hasMessageId) && textLength > 0) fallback = node;
+      node = node.parentElement;
+      depth += 1;
+    }
+
+    return fallback;
+  }
+
+  function containsWithinScope(scope, el) {
+    const root = scope && typeof scope.contains === "function" ? scope : document;
+    return Boolean(root === el || root.contains(el));
+  }
+
+  function isLikelyMessageTurn(el, scope) {
+    if (!(el instanceof HTMLElement)) return false;
+    if (!containsWithinScope(scope, el)) return false;
+    if (el.closest("nav, aside, header, footer, [data-testid='conversation-sidebar']")) return false;
+    if (el.matches("nav, aside, header, footer")) return false;
+    if (el.id === LOAD_MORE_ID || el.id === STATUS_ID) return false;
+
+    const testId = String(el.getAttribute("data-testid") || "");
+    if (testId.includes("conversation-turn")) return true;
+    if (el.hasAttribute("data-turn-id")) return true;
+    if (el.hasAttribute("data-message-id")) return true;
+    if (el.querySelector && el.querySelector(ROLE_SELECTOR)) return true;
+    if (el.querySelector && el.querySelector("[data-message-id]")) return true;
+
+    const textLength = (el.textContent || "").trim().length;
+    return textLength > 0 && Boolean(el.querySelector && el.querySelector(".markdown, .prose"));
   }
 
   function safeQueryAll(selector, scope) {
@@ -491,8 +678,10 @@
     const container = firstVisible && firstVisible.parentElement;
 
     if (hiddenCount > 0) {
+      const batchCount = Math.min(hiddenCount, settings.loadMoreBatch * 2);
       loadMoreButton.dataset.mode = "more";
-      loadMoreButton.textContent = `이전 메시지 ${Math.min(hiddenCount, settings.loadMoreBatch * 2)}개 더 보기 · 숨김 ${hiddenCount}개`;
+      loadMoreButton.textContent = `이전 메시지 ${batchCount}개 더 보기 · 숨김 ${hiddenCount}개`;
+      lastLoadMoreState = { visible: true, mode: "more", hiddenCount, reason: "hidden-dom" };
       loadMoreButton.onclick = () => {
         extraVisibleMessages += settings.loadMoreBatch * 2;
         scanAndApply();
@@ -507,6 +696,7 @@
     if (apiTrimmedCurrentConversation && settings.apiTrimEnabled) {
       loadMoreButton.dataset.mode = "full";
       loadMoreButton.textContent = "전체 대화 로드하기 · 느려질 수 있음";
+      lastLoadMoreState = { visible: true, mode: "full", hiddenCount: 0, reason: "api-trimmed" };
       loadMoreButton.onclick = () => {
         try {
           localStorage.setItem(BYPASS_KEY, "true");
@@ -524,20 +714,47 @@
 
   function showLoadMore(container, beforeNode) {
     if (!loadMoreButton) return;
-    if (!container) {
-      const fallback = getMessageScope() || document.body || document.documentElement;
-      if (fallback && loadMoreButton.parentElement !== fallback) fallback.prepend(loadMoreButton);
+
+    // Prefer a body-level floating control. In recent ChatGPT layouts, inserting the
+    // button into the message flex/virtual-scroll container can make it invisible or
+    // clipped by an ancestor. Body-level placement keeps the control discoverable.
+    if (document.body) {
+      if (loadMoreButton.parentElement !== document.body) document.body.appendChild(loadMoreButton);
+      loadMoreButton.dataset.floating = "true";
       loadMoreButton.hidden = false;
+      loadMoreButton.removeAttribute("hidden");
+      lastLoadMoreState.visible = true;
+      lastLoadMoreState.reason = "body-floating";
       return;
     }
+
+    if (!container) {
+      const fallback = getMessageScope() || document.documentElement;
+      if (fallback && loadMoreButton.parentElement !== fallback) fallback.prepend(loadMoreButton);
+      loadMoreButton.dataset.floating = "false";
+      loadMoreButton.hidden = false;
+      loadMoreButton.removeAttribute("hidden");
+      lastLoadMoreState.visible = true;
+      lastLoadMoreState.reason = "fallback-prepend";
+      return;
+    }
+
     if (loadMoreButton.parentElement !== container || loadMoreButton.nextSibling !== beforeNode) {
       container.insertBefore(loadMoreButton, beforeNode || container.firstChild);
     }
+    loadMoreButton.dataset.floating = "false";
     loadMoreButton.hidden = false;
+    loadMoreButton.removeAttribute("hidden");
+    lastLoadMoreState.visible = true;
+    lastLoadMoreState.reason = "inline";
   }
 
   function hideLoadMore() {
-    if (loadMoreButton) loadMoreButton.hidden = true;
+    if (loadMoreButton) {
+      loadMoreButton.hidden = true;
+      loadMoreButton.setAttribute("hidden", "");
+    }
+    lastLoadMoreState = { visible: false, mode: "none", hiddenCount: 0, reason: "hidden" };
   }
 
   function updateStatus(hiddenCount, total) {
@@ -586,12 +803,30 @@
       routeActive: isLikelyChatSurface(),
       enabled: settings.enabled,
       apiTrimmedCurrentConversation,
+      contentVersion: CONTENT_VERSION,
+      mainWorldVersion: document.documentElement ? document.documentElement.getAttribute("data-cgpt-lb-main-version") : null,
       settings: { ...settings },
       dom: { ...lastDomMetrics, nodes: countDomNodes() },
       api: readApiStats(),
       memory: getMemorySnapshot(),
       css: {
         contentVisibilitySupported: Boolean(window.CSS && CSS.supports && CSS.supports("content-visibility", "auto"))
+      },
+      maintenance: {
+        enabled: Boolean(settings.maintenanceEnabled),
+        intervalSec: settings.maintenanceIntervalSec,
+        lastRunAt: lastMaintenanceAt || null,
+        pendingRelevantMutations,
+        lastObservedTurnTotal
+      },
+      cache: {
+        entries: settings.apiCacheEntries,
+        maxKb: settings.apiCacheMaxKb
+      },
+      loadMore: {
+        ...lastLoadMoreState,
+        inDom: Boolean(loadMoreButton && document.documentElement && document.documentElement.contains(loadMoreButton)),
+        text: loadMoreButton && !loadMoreButton.hidden ? loadMoreButton.textContent : ""
       },
       timestamp: Date.now()
     };
@@ -620,8 +855,11 @@
   function cleanup() {
     stopObserver();
     if (navigationTimer) clearInterval(navigationTimer);
+    if (maintenanceTimer) clearInterval(maintenanceTimer);
     if (scanTimer) clearTimeout(scanTimer);
     navigationTimer = 0;
+    maintenanceTimer = 0;
+    maintenanceScheduled = false;
     scanTimer = 0;
     lastDomMetrics = { total: 0, hidden: 0, visible: 0 };
   }

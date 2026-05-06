@@ -1,19 +1,25 @@
 (() => {
   "use strict";
 
-  const FETCH_PATCH_FLAG = "__CGPT_LONG_CHAT_LOADER_FETCH_PATCHED__";
+  const MAIN_WORLD_VERSION = "0.5.0";
+  const FETCH_PATCH_FLAG = "__CGPT_LONG_CHAT_LOADER_FETCH_PATCHED_V050__";
   const HISTORY_PATCH_FLAG = "__CGPT_LONG_CHAT_LOADER_HISTORY_PATCHED__";
   const SETTINGS_KEY = "cgptLongChatLoader.settings";
   const SETTINGS_ATTR = "data-cgpt-lb-settings";
   const TRIMMED_ATTR = "data-cgpt-lb-api-trimmed";
   const KEPT_ATTR = "data-cgpt-lb-api-kept";
   const STATS_ATTR = "data-cgpt-lb-api-stats";
+  const MAIN_VERSION_ATTR = "data-cgpt-lb-main-version";
   const BYPASS_KEY = "cgptLongChatLoader.bypassOnce";
   const SETTINGS_EVENT = "cgpt-lb-settings";
   const STATS_EVENT = "cgpt-lb-trim-stats";
   const LOCATION_EVENT = "cgpt-lb-locationchange";
+  const MAINTENANCE_EVENT = "cgpt-lb-maintenance";
   const DEBUG_PREFIX = "[ChatGPT Long Chat Loader]";
-  const RESPONSE_CACHE_HARD_MAX = 3;
+  const RESPONSE_CACHE_HARD_MAX = 2;
+  const RESPONSE_CACHE_TTL_MS = 60_000;
+  const STATS_TTL_MS = 180_000;
+  const CACHE_MEMORY_PRESSURE_RATIO = 0.75;
 
   const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
@@ -21,7 +27,10 @@
     visibleTurns: 4,
     loadMoreBatch: 4,
     prefetchBatches: 2,
-    apiCacheEntries: 0,
+    apiCacheEntries: 1,
+    apiCacheMaxKb: 1024,
+    maintenanceEnabled: true,
+    maintenanceIntervalSec: 30,
     cssContainmentEnabled: true,
     showStatus: false,
     debug: false
@@ -30,6 +39,7 @@
   const responseCache = new Map();
   let settingsFromBridge = null;
 
+  markMainWorldVersion();
   installLocationChangePatch();
 
   if (window[FETCH_PATCH_FLAG]) return;
@@ -45,6 +55,13 @@
       settingsFromBridge = null;
     }
   });
+
+  window.addEventListener(MAINTENANCE_EVENT, handleMaintenanceEvent);
+  window.addEventListener(LOCATION_EVENT, () => {
+    responseCache.clear();
+    clearTrimSignal();
+  }, { passive: true });
+  window.addEventListener("pagehide", () => responseCache.clear(), { once: true });
 
   const originalFetch = window.fetch;
   if (typeof originalFetch !== "function") return;
@@ -80,6 +97,7 @@
         timestamp: Date.now(),
         pageUrl: location.href
       };
+      stats.cacheEligible = shouldStoreCache(settings, cached.body, stats);
       signalStats(stats);
       debug(settings, "cache hit", cacheKey);
       return buildResponse(cached.meta, cached.body, true);
@@ -131,11 +149,15 @@
         keepRenderableMessages,
         keepVisibleMessages: keepRenderableMessages,
         cacheHit: false,
+        cacheEligible: false,
+        cacheStored: false,
+        cacheMaxKb: settings.apiCacheMaxKb,
         timestamp: Date.now(),
         pageUrl: location.href,
         requestUrl
       };
 
+      stats.cacheEligible = shouldStoreCache(settings, body, stats);
       signalStats(stats);
       debug(
         settings,
@@ -152,12 +174,28 @@
     const rewritten = buildResponse(meta, body, jsonLike);
     text = "";
 
-    if (stats && stats.trimmed && settings.apiCacheEntries > 0) {
-      putCached(settings, cacheKey, { body, stats, meta });
+    if (stats && stats.trimmed) {
+      stats.cacheStored = putCached(settings, cacheKey, { body, stats, meta });
+      if (stats.cacheStored) signalStats(stats);
     }
 
     return rewritten;
   };
+
+
+  function markMainWorldVersion() {
+    const apply = () => {
+      try {
+        if (document.documentElement) document.documentElement.setAttribute(MAIN_VERSION_ATTR, MAIN_WORLD_VERSION);
+      } catch {
+        // Non-critical bridge failure.
+      }
+    };
+    apply();
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", apply, { once: true });
+    }
+  }
 
   function installLocationChangePatch() {
     if (window[HISTORY_PATCH_FLAG]) return;
@@ -244,7 +282,10 @@
       visibleTurns: clampInt(merged.visibleTurns, 1, 100, DEFAULT_SETTINGS.visibleTurns),
       loadMoreBatch: clampInt(merged.loadMoreBatch, 1, 100, DEFAULT_SETTINGS.loadMoreBatch),
       prefetchBatches: clampInt(merged.prefetchBatches, 0, 30, DEFAULT_SETTINGS.prefetchBatches),
-      apiCacheEntries: clampInt(cacheValue, 0, RESPONSE_CACHE_HARD_MAX, DEFAULT_SETTINGS.apiCacheEntries),
+      apiCacheEntries: clampInt(cacheValue, 1, RESPONSE_CACHE_HARD_MAX, DEFAULT_SETTINGS.apiCacheEntries),
+      apiCacheMaxKb: clampInt(merged.apiCacheMaxKb, 128, 4096, DEFAULT_SETTINGS.apiCacheMaxKb),
+      maintenanceEnabled: Boolean(merged.maintenanceEnabled),
+      maintenanceIntervalSec: clampInt(merged.maintenanceIntervalSec, 10, 300, DEFAULT_SETTINGS.maintenanceIntervalSec),
       cssContainmentEnabled: Boolean(merged.cssContainmentEnabled ?? merged.contentVisibilityEnabled),
       showStatus: Boolean(merged.showStatus),
       debug: Boolean(merged.debug)
@@ -318,6 +359,44 @@
     }
   }
 
+  function handleMaintenanceEvent(event) {
+    const settings = readSettings();
+    let detail = null;
+    const raw = event && typeof event.detail === "string" ? event.detail : "";
+    if (raw) {
+      try {
+        detail = JSON.parse(raw);
+      } catch {
+        detail = null;
+      }
+    }
+
+    if (!settings.enabled || !settings.maintenanceEnabled || isMemoryPressureHigh()) {
+      responseCache.clear();
+    } else if (detail && detail.mode === "clear-cache") {
+      responseCache.clear();
+    } else {
+      pruneCache(settings.apiCacheEntries);
+    }
+
+    clearStaleTrimSignal();
+  }
+
+  function clearStaleTrimSignal() {
+    const root = document.documentElement;
+    if (!root) return;
+    const raw = root.getAttribute(STATS_ATTR);
+    if (!raw) return;
+    try {
+      const stats = JSON.parse(raw);
+      const timestamp = Number(stats && stats.timestamp);
+      if (timestamp && Date.now() - timestamp <= STATS_TTL_MS && (!stats.pageUrl || stats.pageUrl === location.href)) return;
+    } catch {
+      // Corrupt stats should not stay attached to the page root.
+    }
+    clearTrimSignal();
+  }
+
   function clearTrimSignal() {
     const root = document.documentElement;
     if (!root) return;
@@ -328,20 +407,33 @@
 
   function putCached(settings, key, value) {
     const max = settings.apiCacheEntries;
-    if (max <= 0) return;
+    if (max <= 0 || !shouldStoreCache(settings, value && value.body, value && value.stats)) {
+      pruneCache(max);
+      return false;
+    }
     responseCache.delete(key);
-    responseCache.set(key, value);
+    responseCache.set(key, {
+      ...value,
+      cachedAt: Date.now(),
+      bodyChars: approximateLength(value && value.body)
+    });
     pruneCache(max);
+    return responseCache.has(key);
   }
 
   function getCached(settings, key) {
     const max = settings.apiCacheEntries;
-    if (max <= 0) {
+    if (max <= 0 || isMemoryPressureHigh()) {
       if (responseCache.size) responseCache.clear();
       return null;
     }
     const entry = responseCache.get(key);
     if (!entry) {
+      pruneCache(max);
+      return null;
+    }
+    if (isExpiredCacheEntry(entry) || !isCacheEntryWithinLimit(settings, entry)) {
+      responseCache.delete(key);
       pruneCache(max);
       return null;
     }
@@ -353,10 +445,43 @@
 
   function pruneCache(max) {
     const cap = Math.max(0, Math.min(RESPONSE_CACHE_HARD_MAX, Number(max) || 0));
+    if (isMemoryPressureHigh()) {
+      responseCache.clear();
+      return;
+    }
+    for (const [key, entry] of responseCache) {
+      if (isExpiredCacheEntry(entry)) responseCache.delete(key);
+    }
     while (responseCache.size > cap) {
       const oldestKey = responseCache.keys().next().value;
       responseCache.delete(oldestKey);
     }
+  }
+
+  function shouldStoreCache(settings, body, stats) {
+    if (!settings || settings.apiCacheEntries <= 0 || !body || isMemoryPressureHigh()) return false;
+    if (stats && !stats.trimmed) return false;
+    return approximateLength(body) <= maxCacheChars(settings);
+  }
+
+  function isCacheEntryWithinLimit(settings, entry) {
+    if (!entry || typeof entry.body !== "string") return false;
+    return approximateLength(entry.body) <= maxCacheChars(settings);
+  }
+
+  function isExpiredCacheEntry(entry) {
+    const cachedAt = Number(entry && entry.cachedAt);
+    return !cachedAt || Date.now() - cachedAt > RESPONSE_CACHE_TTL_MS;
+  }
+
+  function maxCacheChars(settings) {
+    return Math.max(1, settings.apiCacheMaxKb || DEFAULT_SETTINGS.apiCacheMaxKb) * 1024;
+  }
+
+  function isMemoryPressureHigh() {
+    const memory = typeof performance !== "undefined" && performance.memory;
+    if (!memory || !memory.jsHeapSizeLimit || !memory.usedJSHeapSize) return false;
+    return memory.usedJSHeapSize / memory.jsHeapSizeLimit >= CACHE_MEMORY_PRESSURE_RATIO;
   }
 
   function responseMeta(response) {

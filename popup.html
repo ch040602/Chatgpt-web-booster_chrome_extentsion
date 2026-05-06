@@ -47,6 +47,14 @@
       font: inherit;
       cursor: pointer;
     }
+    .doc-row {
+      display: flex;
+      gap: 8px;
+      margin: 8px 0 10px;
+    }
+    .doc-row button {
+      flex: 1;
+    }
     .row,
     .metrics {
       border-top: 1px solid color-mix(in srgb, CanvasText 14%, Canvas 86%);
@@ -99,6 +107,11 @@
 <body>
   <h1>ChatGPT Long Chat Loader</h1>
 
+  <div class="doc-row">
+    <button id="openReadme" type="button">README</button>
+    <button id="openReadmeKo" type="button">한국어 README</button>
+  </div>
+
   <section id="metrics" class="metrics" aria-live="polite">
     <div class="metric-top">
       <h2>현재 탭 추정</h2>
@@ -129,6 +142,16 @@
     <input id="showStatus" type="checkbox">
   </label>
 
+  <label>
+    <span>대화 중 자동 정리</span>
+    <input id="maintenanceEnabled" type="checkbox">
+  </label>
+
+  <label>
+    <span>자동 정리 주기(초)</span>
+    <input id="maintenanceIntervalSec" type="number" min="10" max="300" step="5">
+  </label>
+
   <div class="row">
     <label>
       <span>처음 표시할 최근 턴</span>
@@ -146,8 +169,13 @@
     </label>
 
     <label>
-      <span>응답 본문 캐시 수</span>
-      <input id="apiCacheEntries" type="number" min="0" max="3" step="1">
+      <span>응답 micro-cache 수</span>
+      <input id="apiCacheEntries" type="number" min="1" max="2" step="1">
+    </label>
+
+    <label>
+      <span>캐시 항목 상한(KB)</span>
+      <input id="apiCacheMaxKb" type="number" min="128" max="4096" step="128">
     </label>
   </div>
 
@@ -157,7 +185,7 @@
   </label>
 
   <div class="hint">
-    RAM 절감을 위해 응답 본문 캐시는 기본 0입니다. 과거 전체 대화가 필요하면 페이지 상단의 전체 대화 로드를 사용합니다.
+    응답 micro-cache는 기본 1개이며 항목당 크기·TTL·메모리 압박 조건으로 제한됩니다. 예상 속도 향상 계산은 팝업을 열 때만 실행됩니다.
   </div>
   <div id="saved"></div>
 

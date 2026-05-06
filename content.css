@@ -10,6 +10,10 @@
   }
 }
 
+#cgpt-lb-load-more[hidden] {
+  display: none !important;
+}
+
 #cgpt-lb-load-more {
   display: block;
   width: fit-content;
@@ -24,6 +28,20 @@
   cursor: pointer;
   z-index: 2147483000;
   contain: layout paint style;
+  pointer-events: auto;
+}
+
+#cgpt-lb-load-more[data-floating="true"] {
+  position: fixed;
+  top: 72px;
+  left: 50%;
+  transform: translateX(-50%);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.14);
+}
+
+#cgpt-lb-load-more[data-floating="false"] {
+  position: sticky;
+  top: 8px;
 }
 
 #cgpt-lb-load-more:hover {

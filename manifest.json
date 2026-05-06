@@ -1,11 +1,13 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Long Chat Loader",
-  "description": "Reduce ChatGPT long-chat loading and RAM pressure with API trimming, DOM windowing, route-aware observers, and popup-only estimates.",
-  "version": "0.3.0",
+  "description": "Reduce ChatGPT long-chat loading and RAM pressure with API trimming, bounded micro-cache, DOM windowing, periodic maintenance, popup-only estimates, and dynamic content-script fallback.",
+  "version": "0.5.0",
   "minimum_chrome_version": "102",
   "permissions": [
-    "storage"
+    "storage",
+    "activeTab",
+    "scripting"
   ],
   "host_permissions": [
     "https://chatgpt.com/*",
