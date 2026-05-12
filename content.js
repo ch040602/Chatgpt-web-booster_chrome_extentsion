@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  const CONTENT_VERSION = "0.9.0";
-  const CONTENT_BOOT_FLAG = "__CGPT_LONG_CHAT_LOADER_CONTENT_ACTIVE_V090__";
+  const CONTENT_VERSION = "1.1.0";
+  const CONTENT_BOOT_FLAG = "__CGPT_LONG_CHAT_LOADER_CONTENT_ACTIVE_V110__";
   if (window[CONTENT_BOOT_FLAG]) {
     try {
       window.dispatchEvent(new CustomEvent("cgpt-lb-force-scan", { detail: CONTENT_VERSION }));
@@ -29,11 +29,14 @@
   const CACHE_SUSPENDED_REASON_ATTR = "data-cgpt-lb-cache-suspended-reason";
   const LIVE_TRIM_BYPASS_UNTIL_ATTR = "data-cgpt-lb-live-trim-bypass-until";
   const LIVE_TRIM_BYPASS_REASON_ATTR = "data-cgpt-lb-live-trim-bypass-reason";
+  const SAFETY_LOCK_KEY = "cgptLongChatLoader.safetyLockUntil";
+  const SAFETY_LOCK_ATTR = "data-cgpt-lb-safety-lock-until";
+  const SAFE_BYPASS_REASON_ATTR = "data-cgpt-lb-safe-bypass-reason";
   const ACTIVE_REPLY_ATTR = "data-cgpt-lb-active-reply";
   const HIDDEN_CLASS = "cgpt-lb-hidden";
   const CONTAINED_CLASS = "cgpt-lb-contained";
   const LIVE_PROTECTED_CLASS = "cgpt-lb-live-protected";
-  const LOAD_MORE_ID = "cgpt-lb-load-more-v090";
+  const LOAD_MORE_ID = "cgpt-lb-load-more-v110";
   const LEGACY_LOAD_MORE_ID = "cgpt-lb-load-more";
   const STATUS_ID = "cgpt-lb-status";
   const TRIM_MARKER_KEY = "cgptLongChatLoader.trimMarkers.v1";
@@ -42,10 +45,13 @@
   const MAX_TRIM_MARKERS = 20;
   const MAX_DEBUG_LOG_ENTRIES = 500;
   const MAX_DEBUG_ARG_LENGTH = 2000;
-  const ACTIVE_REPLY_PROTECTION_MS = 4 * 60 * 1000;
-  const ACTIVE_REPLY_IDLE_GRACE_MS = 20 * 1000;
-  const ACTIVE_REPLY_WATCHDOG_INTERVAL_MS = 3000;
-  const ACTIVE_REPLY_MAX_SILENT_MS = 45 * 1000;
+  const ACTIVE_REPLY_PROTECTION_MS = 8 * 60 * 1000;
+  const THINKING_PROTECTION_MS = 15 * 60 * 1000;
+  const ACTIVE_REPLY_IDLE_GRACE_MS = 60 * 1000;
+  const ACTIVE_REPLY_WATCHDOG_INTERVAL_MS = 2500;
+  const ACTIVE_REPLY_MAX_SILENT_MS = 3 * 60 * 1000;
+  const CHARACTER_DATA_SCAN_THROTTLE_MS = 1800;
+  const SAFETY_LOCK_MS = 30 * 60 * 1000;
   const TURN_SELECTOR = [
     '[data-testid^="conversation-turn-"]',
     '[data-testid*="conversation-turn"]',
@@ -68,13 +74,14 @@
   const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     apiTrimEnabled: true,
-    visibleTurns: 4,
+    safeNetworkMode: true,
+    visibleTurns: 3,
     loadMoreBatch: 4,
-    prefetchBatches: 2,
+    prefetchBatches: 1,
     apiCacheEntries: 1,
-    apiCacheMaxKb: 1024,
+    apiCacheMaxKb: 512,
     maintenanceEnabled: true,
-    maintenanceIntervalSec: 30,
+    maintenanceIntervalSec: 45,
     cssContainmentEnabled: true,
     showStatus: false,
     debug: false
@@ -100,6 +107,7 @@
   let lastMaintenanceAt = 0;
   let pendingRelevantMutations = 0;
   let lastObservedTurnTotal = 0;
+  let lastCharacterDataScanAt = 0;
   let lastLoadMoreState = { visible: false, mode: "none", hiddenCount: 0, reason: "init", placement: "none" };
   let liveReplyState = { active: false, reason: "init", lastSeenAt: 0, protectedCount: 0 };
   let lastActiveSignalAt = 0;
@@ -165,6 +173,7 @@
     return {
       enabled: Boolean(merged.enabled),
       apiTrimEnabled: Boolean(merged.apiTrimEnabled),
+      safeNetworkMode: merged.safeNetworkMode === false ? false : true,
       visibleTurns: clampInt(merged.visibleTurns, 1, 100, DEFAULT_SETTINGS.visibleTurns),
       loadMoreBatch: clampInt(merged.loadMoreBatch, 1, 100, DEFAULT_SETTINGS.loadMoreBatch),
       prefetchBatches: clampInt(merged.prefetchBatches, 0, 30, DEFAULT_SETTINGS.prefetchBatches),
@@ -459,8 +468,15 @@
     if (mutation.type === "attributes") {
       const target = mutation.target instanceof Element ? mutation.target : null;
       if (!target || isExtensionUi(target)) return false;
-      if (isStreamingIndicatorElement(target) || isInsideMessageOrComposer(target)) {
-        if (isStreamingIndicatorElement(target)) markActiveReply("stream-attribute", ACTIVE_REPLY_PROTECTION_MS);
+      if (isStreamingIndicatorElement(target) || hasThinkingMarker(target) || isInsideMessageOrComposer(target)) {
+        if ((matchesUnusualActivityText(target.textContent) || matchesUnusualActivityText(target.getAttribute("aria-label"))) && !isInsideUserTurnOrComposer(target)) {
+          setSafetyLock("unusual-activity-notice", SAFETY_LOCK_MS);
+          markActiveReply("unusual-activity-notice", SAFETY_LOCK_MS, 12);
+        } else if (hasThinkingMarker(target) || matchesThinkingText(target.textContent) || matchesThinkingText(target.getAttribute("aria-label"))) {
+          markActiveReply("thinking-attribute", THINKING_PROTECTION_MS, 12);
+        } else if (isStreamingIndicatorElement(target)) {
+          markActiveReply("stream-attribute", ACTIVE_REPLY_PROTECTION_MS, 8);
+        }
         return true;
       }
       return false;
@@ -480,14 +496,30 @@
   function isRelevantNode(node) {
     if (!(node instanceof Element)) return false;
     if (isExtensionUi(node)) return false;
+    if (matchesUnusualActivityText(node.textContent) && !isInsideUserTurnOrComposer(node)) {
+      setSafetyLock("unusual-activity-notice", SAFETY_LOCK_MS);
+      markActiveReply("unusual-activity-notice", SAFETY_LOCK_MS, 12);
+      return true;
+    }
+    if (hasThinkingMarker(node) || matchesThinkingText(node.textContent) || matchesThinkingText(node.getAttribute && node.getAttribute("aria-label"))) {
+      markActiveReply("thinking-node", THINKING_PROTECTION_MS, 12);
+      return true;
+    }
     if (node.matches && (node.matches(TURN_SELECTOR) || node.matches(ROLE_SELECTOR))) return true;
-    return Boolean(node.querySelector && node.querySelector(`${TURN_SELECTOR}, ${ROLE_SELECTOR}`));
+    return Boolean(node.querySelector && node.querySelector(`${TURN_SELECTOR}, ${ROLE_SELECTOR}, [data-testid*="think"], [data-testid*="reason"], [aria-label*="think"], [aria-label*="reason"]`));
   }
 
   function isInsideMessageOrComposer(el) {
     if (!(el instanceof Element)) return false;
     if (isExtensionUi(el)) return false;
     return Boolean(el.closest(`${TURN_CLOSEST_SELECTOR}, [data-testid*="composer"], form, textarea, [contenteditable='true'], [role='textbox']`));
+  }
+
+  function isInsideUserTurnOrComposer(el) {
+    if (!(el instanceof Element)) return false;
+    const turn = el.closest && el.closest(TURN_CLOSEST_SELECTOR);
+    if (turn && isLikelyUserTurn(turn)) return true;
+    return Boolean(el.closest && el.closest('[data-testid*="composer"], form, textarea, [contenteditable="true"], [role="textbox"]'));
   }
 
   function isStreamingIndicatorElement(el) {
@@ -880,7 +912,16 @@
 
     const latest = Array.isArray(turns) && turns.length ? turns[turns.length - 1] : null;
     if (latest && isLikelyAssistantTurn(latest) && hasStreamingMarker(latest)) {
-      return { active: true, reason: "latest-assistant-streaming", protectedCount: 6 };
+      return { active: true, reason: "latest-assistant-streaming", protectedCount: 8 };
+    }
+
+    const thinkingNotice = findThinkingOrReasoningElement(turns, scope);
+    if (thinkingNotice) return { active: true, reason: "thinking-or-reasoning-visible", protectedCount: 12 };
+
+    const safetyNotice = findUnusualActivityNotice(turns, scope);
+    if (safetyNotice) {
+      setSafetyLock("unusual-activity-notice", SAFETY_LOCK_MS);
+      return { active: true, reason: "unusual-activity-notice", protectedCount: 12 };
     }
 
     const recoveryNotice = findStreamRecoveryNotice(turns, scope);
@@ -918,6 +959,87 @@
     if (text.includes("streaming") && (text.includes("stopped") || text.includes("interrupted")) && (text.includes("waiting") || text.includes("complete") || text.includes("completion"))) return true;
     if (text.includes("stream") && text.includes("message") && text.includes("completion")) return true;
     return false;
+  }
+
+  function findThinkingOrReasoningElement(turns, scope) {
+    const recentTurns = Array.isArray(turns) ? turns.slice(-12) : [];
+    for (const turn of recentTurns) {
+      if (!isLikelyAssistantTurn(turn)) continue;
+      if (hasThinkingMarker(turn) || matchesThinkingText(turn && turn.textContent)) return turn;
+    }
+
+    const root = scope && typeof scope.querySelectorAll === "function" ? scope : document;
+    const candidates = safeQueryAll('[data-testid*="think"], [data-testid*="reason"], [data-testid*="thought"], [aria-label*="think"], [aria-label*="reason"], [aria-label*="thought"], [data-state*="think"], [data-state*="reason"], [role="status"], [aria-live]', root);
+    for (const el of candidates) {
+      if (isExtensionUi(el)) continue;
+      const enclosingTurn = el.closest && el.closest(TURN_CLOSEST_SELECTOR);
+      if (enclosingTurn && isLikelyUserTurn(enclosingTurn)) continue;
+      if (hasThinkingMarker(el) || matchesThinkingText(el.textContent) || matchesThinkingText(el.getAttribute("aria-label"))) return el;
+    }
+    return null;
+  }
+
+  function findUnusualActivityNotice(turns, scope) {
+    const recentTurns = Array.isArray(turns) ? turns.slice(-12) : [];
+    for (const turn of recentTurns) {
+      if (turn && isLikelyUserTurn(turn)) continue;
+      if (matchesUnusualActivityText(turn && turn.textContent)) return turn;
+    }
+    const root = scope && typeof scope.querySelectorAll === "function" ? scope : document;
+    const candidates = safeQueryAll('[role="status"], [role="alert"], [aria-live], [data-testid*="toast"], [data-testid*="error"]', root);
+    for (const el of candidates) {
+      if (isExtensionUi(el) || isInsideUserTurnOrComposer(el)) continue;
+      if (matchesUnusualActivityText(el.textContent) || matchesUnusualActivityText(el.getAttribute("aria-label"))) return el;
+    }
+    return null;
+  }
+
+  function hasThinkingMarker(el) {
+    if (!(el instanceof HTMLElement)) return false;
+    const haystack = [
+      el.getAttribute("data-testid"),
+      el.getAttribute("aria-label"),
+      el.getAttribute("data-state"),
+      el.getAttribute("class")
+    ].map((value) => String(value || "").toLowerCase()).join(" ");
+    return /think|reason|thought|reasoning|analysis|analyz/.test(haystack);
+  }
+
+  function matchesThinkingText(value) {
+    const text = String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (!text) return false;
+    if (/\b(thinking|reasoning|thought|analyzing|working)\b/.test(text)) return true;
+    if (/\bthought for\b/.test(text)) return true;
+    if (text.includes("생각 중") || text.includes("생각중") || text.includes("추론 중") || text.includes("추론중")) return true;
+    if (text.includes("생각하는 중") || text.includes("분석 중") || text.includes("분석중")) return true;
+    return false;
+  }
+
+  function matchesUnusualActivityText(value) {
+    const text = String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (!text) return false;
+    if (text.includes("unusual-activity") || text.includes("suspicious-activity")) return true;
+    if (text.includes("unusual activity has been detected") && text.includes("try again later")) return true;
+    if (text.includes("we detect suspicious activity") || text.includes("unusual activity detected")) return true;
+    if (text.includes("비정상") && text.includes("활동")) return true;
+    if (text.includes("의심스러운") && text.includes("활동")) return true;
+    return false;
+  }
+
+  function isThinkingReason(value) {
+    const text = String(value || "").toLowerCase();
+    return /think|reason|thought|analysis|analyz|추론|생각|분석/.test(text);
+  }
+
+  function setSafetyLock(reason, ttlMs) {
+    const until = Date.now() + Math.max(60_000, Number(ttlMs) || SAFETY_LOCK_MS);
+    try { localStorage.setItem(SAFETY_LOCK_KEY, String(until)); } catch { /* ignore */ }
+    if (document.documentElement) {
+      document.documentElement.setAttribute(SAFETY_LOCK_ATTR, String(until));
+      document.documentElement.setAttribute(SAFE_BYPASS_REASON_ATTR, String(reason || "safety lock"));
+      document.documentElement.setAttribute("data-cgpt-lb-safe-bypass-at", String(Date.now()));
+    }
+    dispatchActiveStateToMain(true, reason || "safety lock", Math.max(60_000, Number(ttlMs) || SAFETY_LOCK_MS));
   }
 
   function findStopControl(scope) {
@@ -963,16 +1085,19 @@
 
   function markActiveReply(reason, ttlMs, protectedCount) {
     const now = Date.now();
-    const count = Math.max(Number(protectedCount) || 0, liveReplyState.protectedCount || 0, 6);
+    const reasonText = String(reason || "active reply");
+    const thinking = isThinkingReason(reasonText);
+    const effectiveTtl = Math.max(5_000, Number(ttlMs) || (thinking ? THINKING_PROTECTION_MS : ACTIVE_REPLY_IDLE_GRACE_MS));
+    const count = Math.max(Number(protectedCount) || 0, liveReplyState.protectedCount || 0, thinking ? 12 : 6);
     liveReplyState = {
       active: true,
-      reason: String(reason || "active reply"),
+      reason: reasonText,
       lastSeenAt: now,
       protectedCount: count,
-      protectUntil: now + Math.max(5_000, Number(ttlMs) || ACTIVE_REPLY_IDLE_GRACE_MS)
+      protectUntil: now + effectiveTtl
     };
     setActiveReplyAttribute(true);
-    dispatchActiveStateToMain(true, liveReplyState.reason, Math.max(30_000, Number(ttlMs) || ACTIVE_REPLY_PROTECTION_MS));
+    dispatchActiveStateToMain(true, liveReplyState.reason, Math.max(30_000, effectiveTtl));
     startActiveReplyWatchdog();
   }
 
@@ -997,8 +1122,9 @@
         scheduleScan(true);
         return;
       }
-      dispatchActiveStateToMain(true, liveReplyState.reason || "active reply", ACTIVE_REPLY_IDLE_GRACE_MS + 10_000);
-      scheduleScan();
+      const ttl = isThinkingReason(liveReplyState.reason) ? THINKING_PROTECTION_MS : ACTIVE_REPLY_IDLE_GRACE_MS + 10_000;
+      dispatchActiveStateToMain(true, liveReplyState.reason || "active reply", ttl);
+      scheduleScan(isThinkingReason(liveReplyState.reason));
     }, ACTIVE_REPLY_WATCHDOG_INTERVAL_MS);
   }
 
@@ -1075,17 +1201,46 @@
       return;
     }
 
+    if (liveState.active) {
+      // During active generation/thinking, avoid broad DOM churn. Only make sure the
+      // current tail and detected thinking/status elements are visible and uncontained;
+      // leave older hidden/visible state untouched until the reply becomes idle.
+      const protectedCount = Math.max(8, Number(liveState.protectedCount) || 8, settings.visibleTurns * 2);
+      const protectedStart = Math.max(0, total - protectedCount);
+      for (let i = protectedStart; i < total; i += 1) {
+        const el = turns[i];
+        applyLiveProtection(el);
+        removeContainment(el);
+        showElement(el);
+      }
+      for (const el of turns) {
+        if (isThinkingOrLiveTurn(el)) {
+          applyLiveProtection(el);
+          removeContainment(el);
+          showElement(el);
+        }
+      }
+      const hiddenNow = turns.filter((el) => el.classList.contains(HIDDEN_CLASS)).length;
+      updateLoadMore(hiddenNow, turns);
+      updateStatus(hiddenNow, total);
+      lastDomMetrics = { total, hidden: hiddenNow, visible: Math.max(0, total - hiddenNow) };
+      return;
+    }
+
     const baseVisibleMessages = settings.visibleTurns * 2;
     const liveExtra = liveState.active ? Math.max(4, Number(liveState.protectedCount) || 6) : 0;
     const visibleLimit = Math.max(2, baseVisibleMessages + extraVisibleMessages + liveExtra);
     let hiddenCount = Math.max(0, total - visibleLimit);
     let actuallyHidden = 0;
 
+    const alwaysProtectedTail = Math.max(6, settings.visibleTurns * 2);
     for (let i = 0; i < total; i += 1) {
       const el = turns[i];
       const liveProtected = isLiveProtectedTurn(i, total, liveState);
+      const tailProtected = i >= Math.max(0, total - alwaysProtectedTail);
+      const thinkingProtected = isThinkingOrLiveTurn(el);
 
-      if (liveProtected) {
+      if (liveProtected || tailProtected || thinkingProtected) {
         applyLiveProtection(el);
         removeContainment(el);
         showElement(el);
@@ -1118,6 +1273,17 @@
     }
     hideLoadMore();
     lastDomMetrics = { total: turns.length, hidden: 0, visible: turns.length };
+  }
+
+  function isThinkingOrLiveTurn(el) {
+    if (!(el instanceof HTMLElement)) return false;
+    if (hasStreamingMarker(el) || hasThinkingMarker(el)) return true;
+    const compactText = String(el.textContent || "").replace(/\s+/g, " ").trim();
+    if (compactText.length > 0 && compactText.length <= 320 && matchesThinkingText(compactText)) return true;
+    return Boolean(el.querySelector && Array.from(el.querySelectorAll('[data-testid*="think"], [data-testid*="reason"], [data-testid*="thought"], [aria-label*="think"], [aria-label*="reason"], [aria-label*="thought"], [aria-busy="true"], [data-streaming="true"]')).some((node) => {
+      const nodeText = String(node && node.textContent || "").replace(/\s+/g, " ").trim();
+      return node instanceof HTMLElement && !isExtensionUi(node) && (hasThinkingMarker(node) || (nodeText.length <= 320 && matchesThinkingText(nodeText)) || isStreamingIndicatorElement(node));
+    }));
   }
 
   function applyContainment(el) {
@@ -1349,6 +1515,8 @@
         maxKb: settings.apiCacheMaxKb,
         ...readCacheSuspensionState()
       },
+      safetyLock: readSafetyLockState(),
+      safeBypass: readSafeBypassState(),
       liveTrimBypass: readLiveTrimBypassState(),
       loadMore: {
         ...lastLoadMoreState,
@@ -1380,6 +1548,32 @@
       suspendedReason: active ? String(reason || "active reply") : "",
       suspendedForSec: active ? Math.max(0, Math.ceil((until - Date.now()) / 1000)) : 0
     };
+  }
+
+  function readSafetyLockState() {
+    let until = 0;
+    try { until = Number(localStorage.getItem(SAFETY_LOCK_KEY) || 0); } catch { until = 0; }
+    const attr = Number(document.documentElement && document.documentElement.getAttribute(SAFETY_LOCK_ATTR) || 0);
+    until = Math.max(until, attr || 0);
+    if (until && Date.now() < until) {
+      return {
+        active: true,
+        until,
+        remainingSec: Math.max(0, Math.round((until - Date.now()) / 1000)),
+        reason: String(document.documentElement && document.documentElement.getAttribute(SAFE_BYPASS_REASON_ATTR) || "safety lock")
+      };
+    }
+    return { active: false };
+  }
+
+  function readSafeBypassState() {
+    const root = document.documentElement;
+    if (!root) return { active: false };
+    const reason = root.getAttribute(SAFE_BYPASS_REASON_ATTR) || "";
+    const url = root.getAttribute("data-cgpt-lb-safe-bypass-url") || "";
+    const at = Number(root.getAttribute("data-cgpt-lb-safe-bypass-at") || 0);
+    const ageSec = at ? Math.max(0, Math.round((Date.now() - at) / 1000)) : null;
+    return { active: Boolean(reason && (!at || Date.now() - at < 180_000)), reason, url, ageSec };
   }
 
   function readLiveTrimBypassState() {

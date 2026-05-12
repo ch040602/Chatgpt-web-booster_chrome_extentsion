@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Long Chat Loader",
-  "description": "Reduce ChatGPT long-chat loading and RAM pressure with API trimming, bounded micro-cache, DOM windowing, streaming-recovery-safe live bypass, popup-only estimates, and a GitHub update helper.",
-  "version": "0.9.0",
+  "description": "Reduce ChatGPT long-chat loading and RAM pressure with safe initial API trimming, live thinking/reasoning protection, bounded micro-cache, popup-only estimates, and a GitHub update helper.",
+  "version": "1.1.0",
   "minimum_chrome_version": "102",
   "permissions": [
     "storage",
@@ -49,7 +49,7 @@
       "css": [
         "content.css"
       ],
-      "run_at": "document_start"
+      "run_at": "document_idle"
     }
   ]
 }

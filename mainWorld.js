@@ -1,8 +1,8 @@
 (() => {
   "use strict";
 
-  const MAIN_WORLD_VERSION = "0.9.0";
-  const FETCH_PATCH_FLAG = "__CGPT_LONG_CHAT_LOADER_FETCH_PATCHED_V090__";
+  const MAIN_WORLD_VERSION = "1.1.0";
+  const FETCH_PATCH_FLAG = "__CGPT_LONG_CHAT_LOADER_FETCH_PATCHED_V110__";
   const HISTORY_PATCH_FLAG = "__CGPT_LONG_CHAT_LOADER_HISTORY_PATCHED__";
   const SETTINGS_KEY = "cgptLongChatLoader.settings";
   const SETTINGS_ATTR = "data-cgpt-lb-settings";
@@ -21,26 +21,32 @@
   const CACHE_SUSPENDED_REASON_ATTR = "data-cgpt-lb-cache-suspended-reason";
   const LIVE_TRIM_BYPASS_UNTIL_ATTR = "data-cgpt-lb-live-trim-bypass-until";
   const LIVE_TRIM_BYPASS_REASON_ATTR = "data-cgpt-lb-live-trim-bypass-reason";
+  const SAFETY_LOCK_KEY = "cgptLongChatLoader.safetyLockUntil";
+  const SAFETY_LOCK_ATTR = "data-cgpt-lb-safety-lock-until";
+  const SAFE_BYPASS_REASON_ATTR = "data-cgpt-lb-safe-bypass-reason";
   const DEBUG_PREFIX = "[ChatGPT Long Chat Loader]";
   const RESPONSE_CACHE_HARD_MAX = 2;
   const RESPONSE_CACHE_TTL_MS = 60_000;
   const STATS_TTL_MS = 180_000;
   const CACHE_MEMORY_PRESSURE_RATIO = 0.75;
   const CACHE_SUSPEND_AFTER_MUTATION_MS = 5 * 60 * 1000;
-  const CACHE_SUSPEND_AFTER_ACTIVE_MS = 3 * 60 * 1000;
-  const LIVE_TRIM_BYPASS_AFTER_MUTATION_MS = 5 * 60 * 1000;
-  const LIVE_TRIM_BYPASS_AFTER_ACTIVE_MS = 3 * 60 * 1000;
+  const CACHE_SUSPEND_AFTER_ACTIVE_MS = 6 * 60 * 1000;
+  const THINKING_BYPASS_MS = 15 * 60 * 1000;
+  const SAFETY_LOCK_MS = 30 * 60 * 1000;
+  const LIVE_TRIM_BYPASS_AFTER_MUTATION_MS = 6 * 60 * 1000;
+  const LIVE_TRIM_BYPASS_AFTER_ACTIVE_MS = 6 * 60 * 1000;
 
   const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     apiTrimEnabled: true,
-    visibleTurns: 4,
+    safeNetworkMode: true,
+    visibleTurns: 3,
     loadMoreBatch: 4,
-    prefetchBatches: 2,
+    prefetchBatches: 1,
     apiCacheEntries: 1,
-    apiCacheMaxKb: 1024,
+    apiCacheMaxKb: 512,
     maintenanceEnabled: true,
-    maintenanceIntervalSec: 30,
+    maintenanceIntervalSec: 45,
     cssContainmentEnabled: true,
     showStatus: false,
     debug: false
@@ -52,6 +58,7 @@
   let cacheSuspendedReason = "";
   let liveTrimBypassUntil = 0;
   let liveTrimBypassReason = "";
+  const initialTrimDoneRoutes = new Set();
 
   markMainWorldVersion();
   installLocationChangePatch();
@@ -81,6 +88,7 @@
     clearTrimSignal();
     updateCacheSuspensionAttributes();
     updateLiveTrimBypassAttributes();
+    updateSafetyLockAttributes();
   }, { passive: true });
   window.addEventListener("pagehide", () => responseCache.clear(), { once: true });
 
@@ -105,8 +113,17 @@
 
     const settings = readSettings();
     refreshCacheSuspensionState();
+    updateSafetyLockAttributes();
     if (!settings.enabled || !settings.apiTrimEnabled) {
       clearTrimSignal();
+      return originalFetch.call(this, input, init);
+    }
+
+    if (isSafetyLockActive()) {
+      responseCache.clear();
+      clearTrimSignal();
+      signalSafeBypass("security notice safety lock", requestUrl);
+      debug(settings, "safety lock active; returning original conversation response", requestUrl);
       return originalFetch.call(this, input, init);
     }
 
@@ -119,8 +136,18 @@
 
     if (isLiveTrimBypassActive()) {
       responseCache.clear();
+      if (settings.safeNetworkMode) markInitialTrimDoneForCurrentRoute(requestUrl);
       signalLiveTrimBypass("live reply protection", requestUrl);
+      signalSafeBypass(liveTrimBypassReason || "live reply protection", requestUrl);
       debug(settings, "live trim bypass: returning original conversation response", requestUrl, liveTrimBypassReason);
+      return originalFetch.call(this, input, init);
+    }
+
+    if (settings.safeNetworkMode && isInitialTrimDoneForCurrentRoute(requestUrl)) {
+      responseCache.clear();
+      clearTrimSignal();
+      signalSafeBypass("safe mode post-initial original pass", requestUrl);
+      debug(settings, "safe mode post-initial original pass", requestUrl);
       return originalFetch.call(this, input, init);
     }
 
@@ -157,6 +184,16 @@
       return response;
     }
 
+    const rawLooksJson = /^[\s\uFEFF]*[\[{]/.test(text);
+    if (!rawLooksJson && matchesUnusualActivityText(text)) {
+      setSafetyLock("unusual-activity-response", SAFETY_LOCK_MS);
+      responseCache.clear();
+      clearTrimSignal();
+      signalSafeBypass("unusual activity response", requestUrl);
+      debug(settings, "unusual activity response detected; entering safety lock", requestUrl);
+      return buildResponse(meta, text, false);
+    }
+
     let body = text;
     let jsonLike = false;
     let stats = null;
@@ -165,6 +202,14 @@
     try {
       const data = JSON.parse(text);
       jsonLike = true;
+      if (isUnusualActivityErrorPayload(data)) {
+        setSafetyLock("unusual-activity-response", SAFETY_LOCK_MS);
+        responseCache.clear();
+        clearTrimSignal();
+        signalSafeBypass("unusual activity response", requestUrl);
+        debug(settings, "unusual activity JSON payload detected; entering safety lock", requestUrl);
+        return buildResponse(meta, text, true);
+      }
       const trimResult = trimChatGptConversation(data, keepRenderableMessages);
 
       if (trimResult.trimmed) {
@@ -196,16 +241,23 @@
         activeGeneration: Boolean(trimResult.activeGeneration),
         protectedNodeCount: trimResult.protectedNodeCount || 0,
         effectiveCurrentNodeChanged: Boolean(trimResult.effectiveCurrentNodeChanged),
+        thinkingOrReasoningActive: Boolean(trimResult.thinkingOrReasoningActive),
+        safeNetworkMode: Boolean(settings.safeNetworkMode),
+        initialOnly: Boolean(settings.safeNetworkMode),
         cacheSuspended: Boolean(cacheSuspended || isResponseCacheSuspended())
       };
 
-      if (stats.activeGeneration || stats.effectiveCurrentNodeChanged) {
-        suspendResponseCache("active generation", CACHE_SUSPEND_AFTER_ACTIVE_MS, settings);
-        beginLiveTrimBypass("active generation", LIVE_TRIM_BYPASS_AFTER_ACTIVE_MS, settings);
+      if (stats.activeGeneration || stats.effectiveCurrentNodeChanged || stats.thinkingOrReasoningActive) {
+        const activeReason = stats.thinkingOrReasoningActive ? "thinking or reasoning active" : "active generation";
+        const activeTtl = stats.thinkingOrReasoningActive ? THINKING_BYPASS_MS : CACHE_SUSPEND_AFTER_ACTIVE_MS;
+        suspendResponseCache(activeReason, activeTtl, settings);
+        beginLiveTrimBypass(activeReason, activeTtl, settings);
         stats.cacheSuspended = true;
         stats.liveTrimBypass = true;
-        signalLiveTrimBypass("active generation", requestUrl);
-        debug(settings, "active generation detected; returning original conversation response", requestUrl);
+        signalLiveTrimBypass(activeReason, requestUrl);
+        signalSafeBypass(activeReason, requestUrl);
+        if (settings.safeNetworkMode) markInitialTrimDoneForCurrentRoute(requestUrl);
+        debug(settings, activeReason + " detected; returning original conversation response", requestUrl);
         return buildResponse(meta, text, jsonLike);
       }
 
@@ -225,6 +277,8 @@
 
     const rewritten = buildResponse(meta, body, jsonLike);
     text = "";
+
+    if (stats && settings.safeNetworkMode) markInitialTrimDoneForCurrentRoute(requestUrl);
 
     if (stats && stats.trimmed) {
       stats.cacheStored = putCached(settings, cacheKey, { body, stats, meta });
@@ -348,6 +402,7 @@
     return {
       enabled: Boolean(merged.enabled),
       apiTrimEnabled: Boolean(merged.apiTrimEnabled),
+      safeNetworkMode: merged.safeNetworkMode === false ? false : true,
       visibleTurns: clampInt(merged.visibleTurns, 1, 100, DEFAULT_SETTINGS.visibleTurns),
       loadMoreBatch: clampInt(merged.loadMoreBatch, 1, 100, DEFAULT_SETTINGS.loadMoreBatch),
       prefetchBatches: clampInt(merged.prefetchBatches, 0, 30, DEFAULT_SETTINGS.prefetchBatches),
@@ -407,6 +462,104 @@
     return false;
   }
 
+  function currentRouteKeyFromUrl(url) {
+    try {
+      const parsed = new URL(url || location.href, location.href);
+      return `${parsed.hostname}${parsed.pathname}`;
+    } catch {
+      return String(location.pathname || location.href || "");
+    }
+  }
+
+  function isInitialTrimDoneForCurrentRoute(url) {
+    return initialTrimDoneRoutes.has(currentRouteKeyFromUrl(url));
+  }
+
+  function markInitialTrimDoneForCurrentRoute(url) {
+    initialTrimDoneRoutes.add(currentRouteKeyFromUrl(url));
+  }
+
+  function matchesUnusualActivityText(value) {
+    const text = String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (!text) return false;
+    if (text.includes("unusual-activity") || text.includes("suspicious-activity")) return true;
+    if (text.includes("unusual activity has been detected") && text.includes("try again later")) return true;
+    if (text.includes("we detect suspicious activity") || text.includes("unusual activity detected")) return true;
+    if (text.includes("비정상") && text.includes("활동")) return true;
+    if (text.includes("의심스러운") && text.includes("활동")) return true;
+    return false;
+  }
+
+  function isUnusualActivityErrorPayload(data) {
+    if (!data || typeof data !== "object") return false;
+    if (data.mapping && typeof data.mapping === "object") return false;
+    const candidates = [
+      data.message,
+      data.detail,
+      data.title,
+      data.error,
+      data.error && data.error.message,
+      data.error && data.error.detail,
+      data.error && data.error.title
+    ];
+    return candidates.some((value) => {
+      if (!value) return false;
+      if (typeof value === "object") {
+        try { return matchesUnusualActivityText(JSON.stringify(value)); } catch { return false; }
+      }
+      return matchesUnusualActivityText(value);
+    });
+  }
+
+  function setSafetyLock(reason, ttlMs) {
+    const until = Date.now() + Math.max(60_000, Number(ttlMs) || SAFETY_LOCK_MS);
+    try { localStorage.setItem(SAFETY_LOCK_KEY, String(until)); } catch { /* ignore */ }
+    if (document.documentElement) {
+      document.documentElement.setAttribute(SAFETY_LOCK_ATTR, String(until));
+      document.documentElement.setAttribute(SAFE_BYPASS_REASON_ATTR, String(reason || "safety lock"));
+      document.documentElement.setAttribute("data-cgpt-lb-safe-bypass-at", String(Date.now()));
+    }
+  }
+
+  function isSafetyLockActive() {
+    let until = 0;
+    try { until = Number(localStorage.getItem(SAFETY_LOCK_KEY) || 0); } catch { until = 0; }
+    if (until && Date.now() < until) {
+      updateSafetyLockAttributes(until);
+      return true;
+    }
+    if (until && Date.now() >= until) {
+      try { localStorage.removeItem(SAFETY_LOCK_KEY); } catch { /* ignore */ }
+    }
+    updateSafetyLockAttributes(0);
+    return false;
+  }
+
+  function updateSafetyLockAttributes(until) {
+    const root = document.documentElement;
+    if (!root) return;
+    const value = Number(until || 0);
+    if (value && Date.now() < value) root.setAttribute(SAFETY_LOCK_ATTR, String(value));
+    else root.removeAttribute(SAFETY_LOCK_ATTR);
+  }
+
+  function signalSafeBypass(reason, requestUrl) {
+    const root = document.documentElement;
+    if (!root) return;
+    try {
+      root.setAttribute(SAFE_BYPASS_REASON_ATTR, String(reason || "safe original pass"));
+      root.setAttribute("data-cgpt-lb-safe-bypass-at", String(Date.now()));
+      if (requestUrl) root.setAttribute("data-cgpt-lb-safe-bypass-url", String(requestUrl));
+    } catch {
+      // Ignore bridge failures.
+    }
+  }
+
+  function isThinkingReason(value) {
+    const text = String(value || "").toLowerCase();
+    return /think|reason|thought|analysis|analyz|추론|생각|분석/.test(text);
+  }
+
   function signalStats(stats) {
     const root = document.documentElement;
     if (!root || !stats) return;
@@ -448,10 +601,16 @@
       retireLiveTrimBypass("active reply idle", 30_000);
       return;
     }
-    const ttl = clampInt(detail.ttlMs, 30_000, CACHE_SUSPEND_AFTER_MUTATION_MS, CACHE_SUSPEND_AFTER_ACTIVE_MS);
-    suspendResponseCache(detail.reason || "active reply", ttl, settings);
-    beginLiveTrimBypass(detail.reason || "active reply", ttl, settings);
-    debug(settings, "cache suspended after active-state signal", detail.reason || "active reply");
+    const reasonText = String(detail.reason || "active reply");
+    if (matchesUnusualActivityText(reasonText)) {
+      setSafetyLock("unusual-activity-notice", SAFETY_LOCK_MS);
+    }
+    const maxTtl = isThinkingReason(reasonText) ? THINKING_BYPASS_MS : CACHE_SUSPEND_AFTER_MUTATION_MS;
+    const fallbackTtl = isThinkingReason(reasonText) ? THINKING_BYPASS_MS : CACHE_SUSPEND_AFTER_ACTIVE_MS;
+    const ttl = clampInt(detail.ttlMs, 30_000, maxTtl, fallbackTtl);
+    suspendResponseCache(reasonText, ttl, settings);
+    beginLiveTrimBypass(reasonText, ttl, settings);
+    debug(settings, "cache suspended after active-state signal", reasonText);
   }
 
   function handleMaintenanceEvent(event) {
@@ -652,7 +811,7 @@
   function shouldStoreCache(settings, body, stats) {
     if (!settings || settings.apiCacheEntries <= 0 || !body || isMemoryPressureHigh() || isResponseCacheSuspended()) return false;
     if (stats && !stats.trimmed) return false;
-    if (stats && (stats.activeGeneration || stats.effectiveCurrentNodeChanged)) return false;
+    if (stats && (stats.activeGeneration || stats.effectiveCurrentNodeChanged || stats.thinkingOrReasoningActive)) return false;
     return approximateLength(body) <= maxCacheChars(settings);
   }
 
@@ -724,7 +883,9 @@
     }
 
     const totalMappingNodes = countOwnProperties(mapping);
-    const activeGenerationIds = collectActiveGenerationNodeIds(mapping);
+    const thinkingOrReasoningIds = collectThinkingOrReasoningNodeIds(mapping);
+    const activeGenerationIds = uniqueIds([...collectActiveGenerationNodeIds(mapping), ...thinkingOrReasoningIds]);
+    const thinkingOrReasoningActive = thinkingOrReasoningIds.length > 0;
     const effectiveCurrentNode = chooseEffectiveCurrentNode(mapping, currentNode, activeGenerationIds);
     const effectiveCurrentNodeChanged = effectiveCurrentNode !== currentNode;
     const chain = buildCurrentChain(mapping, effectiveCurrentNode);
@@ -748,6 +909,7 @@
         totalMappingNodes,
         keptMappingNodes: totalMappingNodes,
         activeGeneration,
+        thinkingOrReasoningActive,
         protectedNodeCount: protectedIds.size,
         effectiveCurrentNodeChanged: false
       };
@@ -782,6 +944,7 @@
         totalMappingNodes,
         keptMappingNodes: totalMappingNodes,
         activeGeneration,
+        thinkingOrReasoningActive,
         protectedNodeCount: protectedIds.size,
         effectiveCurrentNodeChanged: false
       };
@@ -800,6 +963,7 @@
       totalMappingNodes,
       keptMappingNodes: countOwnProperties(newMapping),
       activeGeneration,
+      thinkingOrReasoningActive,
       protectedNodeCount: protectedIds.size,
       effectiveCurrentNodeChanged
     };
@@ -873,6 +1037,25 @@
       if (isActiveGenerationNode(mapping[id])) ids.push(id);
     }
     return sortNodeIdsByTime(mapping, ids);
+  }
+
+  function collectThinkingOrReasoningNodeIds(mapping) {
+    const ids = [];
+    for (const id of Object.keys(mapping || {})) {
+      if (isThinkingOrReasoningNode(mapping[id])) ids.push(id);
+    }
+    return sortNodeIdsByTime(mapping, ids);
+  }
+
+  function uniqueIds(ids) {
+    const seen = new Set();
+    const result = [];
+    for (const id of ids || []) {
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      result.push(id);
+    }
+    return result;
   }
 
   function collectRecentRenderableNodeIds(mapping, limit) {
@@ -950,12 +1133,47 @@
     const metadata = message.metadata || {};
     if (metadata.is_visually_hidden_from_conversation === true || metadata.is_hidden_from_ui === true) return false;
 
-    const status = String(message.status || node.status || metadata.status || "").toLowerCase();
-    if (status && !/(finish|finished|success|complete|completed)/i.test(status)) return true;
+    const status = String(message.status || node.status || metadata.status || metadata.state || "").toLowerCase();
+    if (status && !/(finish|finished|success|complete|completed|done)/i.test(status)) return true;
     if (message.end_turn === false) return true;
-    if (metadata.is_complete === false || metadata.complete === false) return true;
+    if (metadata.is_complete === false || metadata.complete === false || metadata.done === false) return true;
     if (metadata.finish_details === null && status && !status.includes("success")) return true;
+    if (isThinkingOrReasoningNode(node)) return true;
     return false;
+  }
+
+  function isThinkingOrReasoningNode(node) {
+    if (!node || typeof node !== "object") return false;
+    const message = node.message;
+    if (!message || typeof message !== "object") return false;
+    const role = message.author && message.author.role;
+    if (role !== "assistant") return false;
+    const metadata = message.metadata || {};
+    if (metadata.is_visually_hidden_from_conversation === true || metadata.is_hidden_from_ui === true) return false;
+
+    const status = String(message.status || node.status || metadata.status || metadata.state || "").toLowerCase();
+    const content = message.content || {};
+    const contentType = String(content.content_type || content.type || "").toLowerCase();
+    const metadataText = safeStringify(metadata).toLowerCase();
+    const markerText = `${contentType} ${status} ${metadataText}`;
+    const hasThinkingMarker = /think|thinking|thought|reason|reasoning|analysis|analyz/.test(markerText);
+    if (!hasThinkingMarker) return false;
+
+    // Treat thinking/reasoning nodes as live only when they look unfinished or current.
+    if (status && !/(finish|finished|success|complete|completed|done)/.test(status)) return true;
+    if (message.end_turn === false) return true;
+    if (metadata.is_complete === false || metadata.complete === false || metadata.done === false) return true;
+    if (metadata.finish_details === null && status && !status.includes("success")) return true;
+    if (/thinking|reasoning|thought|analysis/.test(contentType) && message.end_turn !== true && !/(finish|finished|success|complete|completed|done)/.test(status)) return true;
+    return false;
+  }
+
+  function safeStringify(value) {
+    try {
+      return JSON.stringify(value || {});
+    } catch {
+      return "";
+    }
   }
 
   function countRenderableNodes(mapping) {

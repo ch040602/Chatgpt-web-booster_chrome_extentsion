@@ -189,6 +189,11 @@
   </label>
 
   <label>
+    <span>네트워크 안전 모드</span>
+    <input id="safeNetworkMode" type="checkbox">
+  </label>
+
+  <label>
     <span>CSS 렌더링 containment</span>
     <input id="cssContainmentEnabled" type="checkbox">
   </label>
@@ -246,7 +251,7 @@
   </div>
 
   <div class="hint">
-    응답 micro-cache는 기본 1개입니다. 답변 생성·스트림 복구 중에는 stale 응답과 rewrite를 모두 피하기 위해 원본 conversation 응답을 통과시킵니다. 예상 속도 향상 계산은 팝업을 열 때만 실행됩니다.
+    응답 micro-cache는 기본 1개입니다. 네트워크 안전 모드에서는 초기 conversation 로딩 1회만 줄이고, 답변 생성·thinking/reasoning·스트림 복구 중에는 원본 conversation 응답을 통과시킵니다. 예상 속도 향상 계산은 팝업을 열 때만 실행됩니다.
   </div>
   <div id="saved"></div>
 

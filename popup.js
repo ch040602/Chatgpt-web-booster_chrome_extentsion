@@ -4,13 +4,14 @@
   const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     apiTrimEnabled: true,
-    visibleTurns: 4,
+    safeNetworkMode: true,
+    visibleTurns: 3,
     loadMoreBatch: 4,
-    prefetchBatches: 2,
+    prefetchBatches: 1,
     apiCacheEntries: 1,
-    apiCacheMaxKb: 1024,
+    apiCacheMaxKb: 512,
     maintenanceEnabled: true,
-    maintenanceIntervalSec: 30,
+    maintenanceIntervalSec: 45,
     cssContainmentEnabled: true,
     showStatus: false,
     debug: false
@@ -154,6 +155,7 @@
     return {
       enabled: Boolean(merged.enabled),
       apiTrimEnabled: Boolean(merged.apiTrimEnabled),
+      safeNetworkMode: merged.safeNetworkMode === false ? false : true,
       visibleTurns: clampInt(merged.visibleTurns, 1, 100, DEFAULT_SETTINGS.visibleTurns),
       loadMoreBatch: clampInt(merged.loadMoreBatch, 1, 100, DEFAULT_SETTINGS.loadMoreBatch),
       prefetchBatches: clampInt(merged.prefetchBatches, 0, 30, DEFAULT_SETTINGS.prefetchBatches),
@@ -309,6 +311,9 @@
     appendMetricLine("더보기 버튼", formatLoadMore(metrics.loadMore));
     appendMetricLine("응답 진행 보호", formatLiveReply(metrics.liveReply));
     appendMetricLine("Live API rewrite", formatLiveTrimBypass(metrics.liveTrimBypass));
+    appendMetricLine("Thinking shield", formatThinkingShield(metrics));
+    appendMetricLine("보안 안전 잠금", formatSafetyLock(metrics.safetyLock));
+    appendMetricLine("Safe original pass", formatSafeBypass(metrics.safeBypass));
     appendMetricLine("Trim 상태", formatTrimState(metrics.trimState));
     appendMetricLine("응답 micro-cache", formatCache(metrics));
     appendMetricLine("API patch", formatApiPatch(metrics));
@@ -441,6 +446,27 @@
     return `원본 통과 · ${formatNumber(state.remainingSec)}초 · ${state.reason || "active reply"}`;
   }
 
+  function formatThinkingShield(metrics) {
+    const live = metrics && metrics.liveReply ? metrics.liveReply : {};
+    const bypass = metrics && metrics.liveTrimBypass ? metrics.liveTrimBypass : {};
+    const reason = String(live.reason || bypass.reason || "");
+    const active = Boolean((live.active || bypass.active) && /think|reason|thought|analysis|analyz|추론|생각|분석/i.test(reason));
+    if (!active) return "대기";
+    const remaining = positiveNumber(bypass.remainingSec) ? ` · ${formatNumber(bypass.remainingSec)}초 원본 통과` : "";
+    return `활성 · ${reason}${remaining}`;
+  }
+
+  function formatSafetyLock(lock) {
+    if (!lock || !lock.active) return "대기";
+    return `활성 · ${formatNumber(lock.remainingSec)}초 · ${lock.reason || "safety"}`;
+  }
+
+  function formatSafeBypass(state) {
+    if (!state || !state.active) return "대기";
+    const age = positiveNumber(state.ageSec) ? ` · ${formatNumber(state.ageSec)}초 전` : "";
+    return `원본 통과 · ${state.reason || "safe mode"}${age}`;
+  }
+
   function formatTrimState(trimState) {
     if (!trimState || !trimState.active) return "없음";
     const source = trimState.statsSource === "session-marker" ? "marker" : trimState.statsSource === "live-or-recent" ? "live" : trimState.statsSource || "active";
@@ -460,12 +486,12 @@
     const api = metrics && metrics.api ? metrics.api : null;
     const cache = metrics && metrics.cache ? metrics.cache : {};
     const entries = positiveNumber(settings.apiCacheEntries) || positiveNumber(cache.entries) || 1;
-    const maxKb = positiveNumber(settings.apiCacheMaxKb) || positiveNumber(cache.maxKb) || 1024;
-    let suffix = "";
-    if (cache && cache.suspended) suffix = ` · 일시중지 ${formatNumber(cache.suspendedForSec)}초 · ${cache.suspendedReason || "active"}`;
-    else if (api && api.cacheHit) suffix = " · hit";
-    else if (api && api.cacheStored) suffix = " · 저장됨";
-    else if (api && api.cacheEligible === false) suffix = " · 미저장";
+    const maxKb = positiveNumber(settings.apiCacheMaxKb) || positiveNumber(cache.maxKb) || 512;
+    let suffix = settings.safeNetworkMode ? " · safe initial-only" : "";
+    if (cache && cache.suspended) suffix += ` · 일시중지 ${formatNumber(cache.suspendedForSec)}초 · ${cache.suspendedReason || "active"}`;
+    else if (api && api.cacheHit) suffix += " · hit";
+    else if (api && api.cacheStored) suffix += " · 저장됨";
+    else if (api && api.cacheEligible === false) suffix += " · 미저장";
     return `${entries}개 · 항목당 ~${formatNumber(maxKb)}KB${suffix}`;
   }
 
